@@ -1,5 +1,18 @@
 #include "rotate.h"
 
+Rotation::Rotation(){
+
+    std::setlocale(LC_ALL, ".UTF-8");
+}
+
+Rotation::~Rotation(){
+    delete[] sleeper_cls_in_;
+    delete[] sleeper_cls_out_;
+    delete[] fastener_cls_in_;
+    delete[] fastener_cls_out_;
+}
+
+
 void Rotation::loadEngine(const std::string& path , const int & flag) {
     size_t size{ 0 };
     char* trtModelStream{ nullptr };
@@ -63,8 +76,8 @@ std::vector<std::string> Rotation::listFiles(const std::string& directory,const 
 
     std::vector<std::string> total_names;
 
-    std::experimental::filesystem::path p(directory);
-    for(auto & entry : std::experimental::filesystem::directory_iterator(p)){
+    std::filesystem::path p(directory);
+    for(auto & entry : std::filesystem::directory_iterator(p)){
         if(entry.path().extension().string() == ext){
             total_names.push_back(entry.path().string());
         }
@@ -167,6 +180,7 @@ void  Rotation::letterBox(const cv::Mat& image, cv::Mat& outImage, cv::Vec4d& pa
 void Rotation::runGround() {
 
   auto total_names = listFiles(dji_img_path_, ".JPG");
+  std::filesystem::create_directories(cropped_img_path_);
 
   for(auto img_path : total_names){
 
@@ -257,8 +271,8 @@ void Rotation::runGround() {
             o << std::setw(4) << j << std::endl;
         }
     }
-
 }
+
 
 void Rotation::rotateInference(cv::Mat & img, json &j){
 
@@ -321,7 +335,6 @@ void Rotation::rotateInference(cv::Mat & img, json &j){
             bboxes.push_back(rotate_rect);
             scores.push_back(box_score);
             label_idxs.push_back(label_index);
-
         }
 
         pdata += net_width; 
@@ -362,6 +375,18 @@ void Rotation::rotateInference(cv::Mat & img, json &j){
 
 std::vector<CsvInfo> Rotation::readCsv(std::string & csv_path){
 
+    std::filesystem::path p(csv_path);
+    std::string path =  p.parent_path().string();
+
+    auto img_names = listFiles(path, ".JPG");
+
+    for(auto &name : img_names){
+        std::filesystem::path p(name);
+        if(std::filesystem::is_regular_file(p)){
+              name = p.filename().string();
+        }
+    }
+
     std::fstream file_stream(csv_path);
     std::string str;
     std::vector<CsvInfo> res;
@@ -371,8 +396,11 @@ std::vector<CsvInfo> Rotation::readCsv(std::string & csv_path){
         std::sregex_token_iterator beg(str.begin(), str.end(), reg, -1);
         std::sregex_token_iterator end;
         std::vector<std::string> splits(beg, end);
-
         CsvInfo csv_info;
+        if(std::find(img_names.begin(), img_names.end(), splits[0]) == img_names.end()){
+            continue;
+        }
+
         csv_info.img_path  = splits[0];
         csv_info.longitude = std::stod(splits[1]);
         csv_info.latitude  = std::stod(splits[2]);
@@ -386,65 +414,75 @@ std::vector<CsvInfo> Rotation::readCsv(std::string & csv_path){
 }
 
 
-
-void Rotation::initParams(HyperParams & params){
-
-    csv_path_ = params.csv_path;
-    second_csv_path_ = params.second_csv_path;
-    json_path_ = params.json_path;
-    first_img_path_ = params.first_img_path;
-    second_img_path_ = params.second_img_path;
-
-    csvinfo_results_ = readCsv(csv_path_);
-    second_csvinfo_results_ = readCsv(second_csv_path_);
-    //resize_ratio_ = params.resize_ratio;
-}
-
-
-
-std::vector<SingleResult> Rotation::runSky(){
+std::vector<SingleResult> Rotation::runSky(int taskID ){
     //第二次巡检得到的图片名、经度、维度。相机SKD使用TCP传过来，现用模拟的数据替代。
-    // CsvInfo second_info;
-
+    current_taskID_ = taskID;
     std::vector<SingleResult> total_results;
+    total_nums_ = second_csvinfo_results_.size();
+    current_idx_ = 0;
     for(CsvInfo & second_info : second_csvinfo_results_){
+        current_idx_++;
+        status_ = 1;
+        {
+            std::unique_lock<std::mutex> lock(mtx_);
+            if(break_flag_){
+                csql_->doSql("DELETE FROM result WHERE taskID = " + std::to_string(taskID) + ";");
+                status_ = 2;
+                return total_results;
+            }
+        }
 
         CsvInfo first_info = findFirstInfo(second_info);
 
         cv::Mat img_object, img_scene;
         cv::Mat obj_temp, scene_temp;
-
         std::string img1_path = first_img_path_ + "/" + first_info.img_path;
         std::string img2_path = second_img_path_+ "/" + second_info.img_path;
         std::thread t1( &Rotation::readAndPreprocess, this, std::ref(img_object), std::ref(obj_temp),   std::ref(img1_path));
         std::thread t2( &Rotation::readAndPreprocess, this, std::ref(img_scene),  std::ref(scene_temp), std::ref(img2_path));
         t1.join();
         t2.join();
-        SingleResult single_result;
+
         cv::Mat H = cudaORB(obj_temp, scene_temp);
+
+        SingleResult single_result;
+        single_result.img_path = second_info.img_path;
+        single_result.longitude = second_info.longitude;
+        single_result.latitude = second_info.latitude;
+        single_result.altitude = second_info.altitude;
+
         if(H.empty()){
             single_result.is_valid = false;
+            csql_->insertResult(taskID, single_result.img_path, single_result.longitude, single_result.latitude, single_result.altitude, single_result.is_valid);
             total_results.push_back(single_result);
             continue;
         }
 
         std::vector<Location> locations = firstToSecond(H, first_info);
+
+        if(locations.empty()){
+            single_result.is_valid = false;
+            csql_->insertResult(taskID, single_result.img_path, single_result.longitude, single_result.latitude, single_result.altitude, single_result.is_valid);
+            total_results.push_back(single_result);
+            continue;
+        }
+
+        single_result.is_valid = true;
+        csql_->insertResult(taskID, single_result.img_path, single_result.longitude, single_result.latitude, single_result.altitude, single_result.is_valid);
+
         skyInference(locations, img_scene);
 
-        single_result.img_path = second_info.img_path;
-        single_result.longitude = second_info.longitude;
-        single_result.latitude = second_info.latitude;
-        single_result.altitude = second_info.altitude;
         single_result.locations = locations;
-        single_result.is_valid = true;
         total_results.push_back(single_result);
+
         drawSingleResult(single_result, img_scene);
 
     }
+    status_ = 3;
+    current_taskID_ = -1;
     return total_results;
 
 }
-
 
 
 CsvInfo Rotation::findFirstInfo(CsvInfo & second_info){
@@ -452,18 +490,14 @@ CsvInfo Rotation::findFirstInfo(CsvInfo & second_info){
     double min_distance = INT32_MAX;
     int min_index = 0;
     for(int i = 0; i < csvinfo_results_.size(); i++) {
-        
         double relative_distance = std::sqrt( std::pow(second_info.latitude - csvinfo_results_[i].latitude,2) + std::pow(second_info.longitude - csvinfo_results_[i].longitude,2));
         if(relative_distance < min_distance){
             min_distance = relative_distance;
             min_index = i;
         }
     }
-
     CsvInfo first_info = csvinfo_results_[min_index];
-
     return first_info;
-
 }
 
 
@@ -476,7 +510,6 @@ void Rotation::readAndPreprocess(cv::Mat & img, cv::Mat & temp, std::string & im
 }
 
 
-
 cv::Mat Rotation::ORB(cv::Mat & img_object, cv::Mat & img_scene){
 
     cv::Ptr<cv::xfeatures2d::SURF> detector = cv::xfeatures2d::SURF::create(nfeatures_);
@@ -487,7 +520,6 @@ cv::Mat Rotation::ORB(cv::Mat & img_object, cv::Mat & img_scene){
     detector->detectAndCompute( img_scene, cv::noArray(), keypoints_scene, descriptors_scene );
 
     cv::Ptr<cv::DescriptorMatcher> matcher = cv::DescriptorMatcher::create(cv::DescriptorMatcher::FLANNBASED);
-
 
     std::vector< std::vector<cv::DMatch> > knn_matches;
 
@@ -526,7 +558,7 @@ cv::Mat Rotation::ORB(cv::Mat & img_object, cv::Mat & img_scene){
 
 cv::Mat Rotation::cudaORB(cv::Mat & img_object, cv::Mat & img_scene){
 
-	cv::Ptr<cv::cuda::ORB> detector = cv::cuda::ORB::create(nfeatures_);
+    cv::Ptr<cv::cuda::ORB> detector = cv::cuda::ORB::create(nfeatures_);
 	
 	cv::cuda::GpuMat gpu_img_object(img_object);
 	cv::cuda::GpuMat gpu_img_secne(img_scene);
@@ -536,6 +568,7 @@ cv::Mat Rotation::cudaORB(cv::Mat & img_object, cv::Mat & img_scene){
 	cv::cuda::GpuMat descriptors_object, descriptors_scene;
 	detector->detectAndComputeAsync( gpu_img_object, cv::cuda::GpuMat(), gpu_keypoints_object, descriptors_object );
 	detector->detectAndComputeAsync( gpu_img_secne, cv::cuda::GpuMat(), gpu_keypoints_scene, descriptors_scene );
+
 
 	std::vector<cv::KeyPoint> keypoints_object, keypoints_scene;
 	detector->convert(gpu_keypoints_object, keypoints_object);
@@ -577,21 +610,23 @@ cv::Mat Rotation::cudaORB(cv::Mat & img_object, cv::Mat & img_scene){
 }
 
 
-
 std::vector<Location> Rotation::firstToSecond(cv::Mat & H, CsvInfo & first_info) {
+
+    std::vector<Location> second_locations;
 
     std::string name =  first_info.img_path.substr(0, first_info.img_path.find_first_of("."));
     std::string first_json_path = json_path_ + "/" + name + ".json";
 
-//  std::string first_json_path = "/home/nvidia/wjd/sift/jsonpath/DJI_20240227105818_0037.json";
-
     std::ifstream json_file(first_json_path); 
-    json j = json::parse(json_file);
+    json j;
+    try {
+         j = json::parse(json_file);
+    } catch (std::exception & e) {
+         return second_locations;
+    }
 
     int height = j["imageHeight"];
     int width = j["imageWidth"];
-
-    std::vector<Location> second_locations;
 
     for(auto &item : j["shapes"]){
 
@@ -657,6 +692,9 @@ std::vector<Location> Rotation::firstToSecond(cv::Mat & H, CsvInfo & first_info)
 
 void Rotation::skyInference( std::vector<Location> & locations, cv::Mat & img){
 
+    int locimgID = csql_->getLastInsertRowid();
+    int itemID = 0;
+
     for(auto & i : locations){
 
         if(i.label != "rail_big"){
@@ -682,13 +720,37 @@ void Rotation::skyInference( std::vector<Location> & locations, cv::Mat & img){
                  cv::rotate(dst_img, dst_img, cv::ROTATE_90_CLOCKWISE);
             }
 
-
             int type = doClassisication(dst_img, i.label);
+
+            if(type){
+                i.label = i.label.substr(0, i.label.find_first_of("_")) + "_normal";
+
+            }else{
+                i.label = i.label.substr(0, i.label.find_first_of("_")) + "_abnormal";
+            }
+
             i.type = type;
+
 
             delete []pts;
             delete []dst_pts;
 
+            if(type){
+                continue;
+            }
+
+            std::string points="";
+
+            for(int k = 0 ; k<i.pts.size() ;k++){
+                if(k == i.pts.size()-1){
+                    points += std::to_string(int(i.pts[k].x)) + "," + std::to_string(int(i.pts[k].y)) ;
+                }else{
+                    points += std::to_string(int(i.pts[k].x)) + "," + std::to_string(int(i.pts[k].y)) + ",";
+                }
+            }
+
+            csql_->insertLocation(locimgID, itemID, i.label, i.type, points);
+            itemID++;
         }
 
     }
@@ -701,23 +763,21 @@ int Rotation::doClassisication(cv::Mat & img, std::string & label){
 
     if(label == "sleeper_normal" || label == "sleeper_abnormal"){
         res = sleeperClassification(img);
-    }else if(label == "fastener_normal" || label == "fastener_abnormal"){
+    }else if(label == "fastener_normal" || label == "fastener_abnormal" || label == "fastener_missing"){
         res = fastenerClassification(img);
-    }else{
-        return 1;
     }
     return res;
 }
 
 
-//int sleeper_index = 0;
 int Rotation::sleeperClassification(cv::Mat & img){
 
-    cv::Mat img_pad;
-    cv::Vec4d params;    
-    letterBox(img, img_pad, params, cv::Size(SLEEPER_INPUT_W_, SLEEPER_INPUT_H_));
-//    cv::imwrite("F:/PLATFORM/tools/sift/testcsv/testimg/"+std::to_string(sleeper_index)+"sleeper.jpg",img_pad);
-//    sleeper_index++;
+//    cv::Mat img_pad;
+//    cv::Vec4d params;
+//    letterBox(img, img_pad, params, cv::Size(SLEEPER_INPUT_W_, SLEEPER_INPUT_H_));
+
+    int padw,padh;
+    cv::Mat img_pad = preprocessImg(img,SLEEPER_INPUT_W_, SLEEPER_INPUT_H_, padw, padh);
 
     int input_index = engine_sleeper_->getBindingIndex(INPUT_NAMES_);
     int output_index = engine_sleeper_->getBindingIndex(OUTPUT_NAMES_);
@@ -744,21 +804,20 @@ int Rotation::sleeperClassification(cv::Mat & img){
     cudaFree(buffers[output_index]);
 
     int index = std::max_element( sleeper_cls_out_, sleeper_cls_out_ + CLASSES_ ) - sleeper_cls_out_;
-
-    //std::cout<<"abnormal sleeper ="<<sleeper_cls_out_[0]<<" normal sleeper = "<<sleeper_cls_out_[1]<<std::endl;
     
     return index;
 }
 
-//int fastener_index = 0;
+
 int Rotation::fastenerClassification(cv::Mat & img){
 
-    cv::Mat img_pad;
-    cv::Vec4d params;    
-    letterBox(img, img_pad, params, cv::Size(FASTENER_INPUT_W_, FASTENER_INPUT_H_));
+//    cv::Mat img_pad;
+//    cv::Vec4d params;
+//    letterBox(img, img_pad, params, cv::Size(FASTENER_INPUT_W_, FASTENER_INPUT_H_));
 
-//    cv::imwrite("F:/PLATFORM/tools/sift/testcsv/testimg/"+std::to_string(fastener_index)+"fastener.jpg",img_pad);
-//    fastener_index++;
+    int padw,padh;
+    cv::Mat img_pad = preprocessImg(img,FASTENER_INPUT_W_, FASTENER_INPUT_H_, padw, padh);
+
 
     int input_index = engine_fastener_->getBindingIndex(INPUT_NAMES_);
     int output_index = engine_fastener_->getBindingIndex(OUTPUT_NAMES_);
@@ -784,11 +843,9 @@ int Rotation::fastenerClassification(cv::Mat & img){
     cudaFree(buffers[output_index]);
 
     int index = std::max_element( fastener_cls_out_, fastener_cls_out_ + CLASSES_ ) - fastener_cls_out_;
-    //std::cout<<"abnormal fastener ="<<fastener_cls_out_[0]<<" normal fastener = "<<fastener_cls_out_[1]<<std::endl;
 
     return index;
 }
-
 
 
 void Rotation::testSky(){
@@ -895,15 +952,14 @@ void Rotation::testORB(){
 }
 
 
-
 static int sleeper_cnt = 18000;
 static int fastener_cnt = 18000;
 void Rotation::readJson(){
 
     std::set<std::string> temp_set;
-    std::experimental::filesystem::path p = "/home/nvidia/wjd/djiimg";
-    for(auto & entry : std::experimental::filesystem::directory_iterator(p)){
-        if(std::experimental::filesystem::is_regular_file(entry)){
+    std::filesystem::path p = "/home/nvidia/wjd/djiimg";
+    for(auto & entry : std::filesystem::directory_iterator(p)){
+        if(std::filesystem::is_regular_file(entry)){
 
             if(entry.path().extension().string() == ".json"){
 
@@ -954,10 +1010,7 @@ void Rotation::readJson(){
                             for(auto i: item["points"]){
 
                                 before_pts.emplace_back(cv::Point2f((float)i[0], (float)i[1]));
-
                             }
-
-
                         }
 
                         cv::RotatedRect rotated_rect = cv::minAreaRect(before_pts) ;
@@ -1020,11 +1073,13 @@ void Rotation::readJson(){
 }
 
 
-
 void Rotation::drawSingleResult(SingleResult & single_result, cv::Mat& img){
 
   std::string save_prefix = save_prefix_;
   std::string img_path = save_prefix + "/" + single_result.img_path;
+
+  std::filesystem::create_directories(save_prefix);
+
   if(!single_result.is_valid){
 
       cv::imwrite(img_path, img);
@@ -1057,29 +1112,10 @@ void Rotation::drawSingleResult(SingleResult & single_result, cv::Mat& img){
 }
 
 
-void Rotation::testRunSky(){
-
-    HyperParams params;
-    params.csv_path = "F:/PLATFORM/tools/sift/testcsv/testcsv_template/template.csv";
-    params.second_csv_path = "F:/PLATFORM/tools/sift/testcsv/testcsv_inspection/inspection.csv";
-    params.json_path = "F:/PLATFORM/tools/sift/testcsv/testcsv_template";
-    params.first_img_path = "F:/PLATFORM/tools/sift/testcsv/testcsv_template";
-    params.second_img_path = "F:/PLATFORM/tools/sift/testcsv/testcsv_inspection";
-
-    std::string fastener_path = "F:/PLATFORM/tools/sift/models/fastener.engine";
-    std::string sleeper_path = "F:/PLATFORM/tools/sift/models/sleeper.engine";
-
-    this->initParams(params);
-    this->loadEngine(sleeper_path, 1);
-    this->loadEngine(fastener_path, 2);
-    auto res = this->runSky();
-
-}
-
 void Rotation::initGroundSky(){
 
         ini::iniReader config;
-        bool ret = config.ReadConfig("../sift/config/config.ini");
+        bool ret = config.ReadConfig("../config/config.ini");
         if(!ret){
             printf("initial failed!\n");
             return;
@@ -1120,7 +1156,420 @@ void Rotation::initGroundSky(){
         //loadEngine(sleeper_detection_path, 0);
         //initDetection();
 
+        std::unique_ptr<CSqliteOperator> csql = std::make_unique<CSqliteOperator>();
+        csql->initSql();
+
+        csql_ = std::move(csql);
+
+}
+
+int Rotation::getTaskID(){
+    return current_taskID_;
+}
+
+int Rotation::getStatus(){
+
+       return status_;
+
+}
+
+float Rotation::getProcess(){
+
+    return  1.0* current_idx_/total_nums_;
+
 }
 
 
+void Rotation::end(){
 
+    std::unique_lock<std::mutex> lock(mtx_);
+    break_flag_ = true;
+
+}
+
+
+bool Rotation::check(std::string & path){
+
+    return std::filesystem::exists(path);
+
+}
+
+
+CheckCode Rotation::init(IniParams & ini_params) {
+
+    if(!check(ini_params.fastener_path)) return CheckCode::FASTENER_FAILED;
+    if(!check(ini_params.sleeper_path)) return CheckCode::SLEEPER_FAILED;
+//    if(!check(ini_params.sql_path)) return CheckCode::SQL_FAILED;
+    if(!check(ini_params.dji_img_path)) return CheckCode::DJI_IMG_FAILED;
+//    if(!check(ini_params.sleeper_detection_path)) return CheckCode::SLEEPER_DET_FAILED;
+//    if(!check(ini_params.fastener_detection_path)) return CheckCode::FASTENER_DET_FAILED;
+
+    std::string fastener_path = ini_params.fastener_path;
+    std::string sleeper_path = ini_params.sleeper_path;
+
+    loadEngine(sleeper_path ,1);
+    loadEngine(fastener_path, 2);
+
+    std::unique_ptr<CSqliteOperator> csql = std::make_unique<CSqliteOperator>();
+    csql->initSql(ini_params.sql_path);
+    csql_ = std::move(csql);
+
+    std::string dji_img_path = ini_params.dji_img_path;
+    std::string sleeper_detection_path = ini_params.sleeper_detection_path;
+    std::string fastener_detection_path = ini_params.fastener_detection_path;
+    std::string cropped_img_path = ini_params.cropped_img_path;
+    float confidence_threshold = ini_params.confidence_threshold;
+    float nms_threshold = ini_params.nms_threshold;
+
+    detection_path_ = fastener_detection_path;
+    obb_path_ = sleeper_detection_path;
+    dji_img_path_ = dji_img_path;
+    cropped_img_path_ = cropped_img_path;
+    CONF_THRESHOLD_ = confidence_threshold;
+    NMS_THRESHOLD_ = nms_threshold;
+    //loadEngine(sleeper_detection_path, 0);
+    //initDetection();
+    status_ = 0;
+    return CheckCode::SUCCEED;
+}
+
+
+CheckCode Rotation::start(StartParams & start_params) {
+    if(!check(start_params.first_csv_path)) return CheckCode::FIRST_CSV_FAILED;
+    if(!check(start_params.second_csv_path)) return CheckCode::SECOND_CSV_FAILED;
+    if(!check(start_params.first_json_path)) return CheckCode::FIRST_JSON_FAILED;
+    if(!check(start_params.first_img_path)) return CheckCode::FIRST_IMG_FAILED;
+    if(!check(start_params.second_img_path)) return CheckCode::SECOND_IMG_FAILED;
+
+    break_flag_ = false;
+    csv_path_ = start_params.first_csv_path;
+    second_csv_path_ =start_params.second_csv_path;
+    json_path_ = start_params.first_json_path;
+    first_img_path_ = start_params.first_img_path;
+    second_img_path_ = start_params.second_img_path;
+    save_prefix_ = start_params.save_second_img_path;
+    csvinfo_results_ = readCsv(csv_path_);
+    second_csvinfo_results_ = readCsv(second_csv_path_);
+    runSky(start_params.taskID);
+
+    return CheckCode::SUCCEED;
+}
+
+void Rotation::testcudaORB(cv::Mat & img_object, cv::Mat & img_scene){
+
+    cv::Ptr<cv::cuda::ORB> detector = cv::cuda::ORB::create(nfeatures_);
+
+    cv::cuda::GpuMat gpu_img_object(img_object);
+    cv::cuda::GpuMat gpu_img_secne(img_scene);
+
+    cv::cuda::GpuMat gpu_keypoints_object;
+    cv::cuda::GpuMat gpu_keypoints_scene;
+    cv::cuda::GpuMat descriptors_object, descriptors_scene;
+    detector->detectAndComputeAsync( gpu_img_object, cv::cuda::GpuMat(), gpu_keypoints_object, descriptors_object );
+    detector->detectAndComputeAsync( gpu_img_secne, cv::cuda::GpuMat(), gpu_keypoints_scene, descriptors_scene );
+
+    std::vector<cv::KeyPoint> keypoints_object, keypoints_scene;
+    detector->convert(gpu_keypoints_object, keypoints_object);
+    detector->convert(gpu_keypoints_scene, keypoints_scene);
+
+    cv::cuda::GpuMat gpu_matches;
+    cv::Ptr<cv::cuda::DescriptorMatcher> matcher = cv::cuda::DescriptorMatcher::createBFMatcher(cv::NORM_HAMMING);
+    matcher->knnMatchAsync(descriptors_object, descriptors_scene, gpu_matches, 2);
+
+    std::vector<std::vector<cv::DMatch>> knn_matches;
+    matcher->knnMatchConvert(gpu_matches, knn_matches);
+
+    const float ratio_thresh = 0.75f;
+    std::vector<cv::DMatch> good_matches;
+    for (size_t i = 0; i < knn_matches.size(); i++)
+    {
+        if (knn_matches[i][0].distance < ratio_thresh * knn_matches[i][1].distance)
+        {
+        good_matches.push_back(knn_matches[i][0]);
+        }
+    }
+
+
+    std::vector<cv::Point2f> obj;
+    std::vector<cv::Point2f> scene;
+    for( size_t i = 0; i < good_matches.size(); i++ ){
+        obj.push_back( keypoints_object[ good_matches[i].queryIdx ].pt );
+        scene.push_back( keypoints_scene[ good_matches[i].trainIdx ].pt );
+    }
+
+    cv::Mat H = findHomography( obj, scene, cv::RANSAC );
+
+
+}
+
+void Rotation::testMatch(){
+
+    cv::Mat img1 = cv::imread(R"(F:\PLATFORM\tools\sift\testcsv\testcsv_template\DJI_20240227105744_0004.JPG)");
+    cv::Mat img2 = cv::imread(R"(F:\PLATFORM\tools\sift\test2.jpg)");
+    cv::Mat img1_gray,img2_gray;
+
+    cv::resize(img1,img1,cv::Size(), 0.4, 0.4);
+    cv::resize(img2,img2,cv::Size(), 0.4, 0.4);
+
+    cv::cvtColor(img1, img1_gray, cv::COLOR_BGR2GRAY);
+    cv::cvtColor(img2, img2_gray, cv::COLOR_BGR2GRAY);
+
+    auto H = cudaORB(img1_gray, img2_gray);
+
+    cv::Mat warp;
+    cv::warpPerspective(img1, warp, H, img1.size());
+
+    cv::Mat dst ;
+    cv::threshold(warp,dst,1,255,cv::THRESH_BINARY);
+
+    cv::Mat img2_dst;
+    cv::bitwise_and(img2,dst,img2_dst);
+
+    cv::Mat sub_img;
+    cv::subtract(img2_dst, warp, sub_img);
+
+
+
+
+    cv::imwrite("../sub_img.jpg",sub_img);
+
+    cv::imwrite("../img2_dst.jpg",img2_dst);
+
+    cv::imwrite("../dst.jpg",dst);
+
+    cv::imwrite("../warp.jpg",warp);
+
+    test_mat_ = img2_dst.clone();
+
+    cv::cvtColor(img2_dst, img2_dst, cv::COLOR_BGR2GRAY);
+    cv::cvtColor(warp, warp, cv::COLOR_BGR2GRAY);
+
+    auto aa = cudaORB2(img2_dst, warp, dst);
+//    for(auto i : aa){
+
+//        cv::circle(img2_dst,i,3,cv::Scalar(0,0,255),3);
+//    }
+//    std::cout<<"aa.size = "<<aa.size()<<std::endl;
+//    cv::imwrite("../out.jpg",img2_dst);
+
+}
+
+
+std::vector<cv::Point2f> Rotation::ORB2(cv::Mat & img_object, cv::Mat & img_scene){
+
+    cv::Ptr<cv::xfeatures2d::SURF> detector = cv::xfeatures2d::SURF::create(2000);
+    std::vector<cv::KeyPoint> keypoints_object, keypoints_scene;
+
+    cv::Mat descriptors_object, descriptors_scene;
+    detector->detectAndCompute( img_object, cv::noArray(), keypoints_object, descriptors_object );
+    detector->detectAndCompute( img_scene, cv::noArray(), keypoints_scene, descriptors_scene );
+
+    std::vector<cv::KeyPoint> test_points;
+    for(int row = 0 ; row < img_scene.rows; row++){
+        for(int col = 0 ; col < img_scene.cols; col++){
+            test_points.push_back(cv::KeyPoint(row,col,1));
+        }
+    }
+   cv::Mat test_out;
+   detector->compute(img_scene,test_points,test_out);
+
+
+
+//    std::cout<<descriptors_scene.type()<<std::endl;
+//    for(int row = 0 ; row<descriptors_scene.rows; row++){
+//        for(int col = 0 ; col <descriptors_scene.cols; col++){
+//            std::cout<<descriptors_scene.at
+//        }
+//    }
+    std::cout<< "descriptors_scene.size="<<descriptors_scene.size()<<std::endl;
+
+    cv::Ptr<cv::DescriptorMatcher> matcher = cv::DescriptorMatcher::create(cv::DescriptorMatcher::FLANNBASED);
+
+    std::vector< std::vector<cv::DMatch> > knn_matches;
+
+    matcher->knnMatch(descriptors_object, descriptors_scene, knn_matches, 2);
+
+
+     std::vector<cv::DMatch> bad_matches;
+    //-- Filter matches using the Lowe's ratio test
+    const float ratio_thresh = 0.75f;
+    std::vector<cv::DMatch> good_matches;
+    int cnt = 0;
+    for (size_t i = 0; i < knn_matches.size(); i++)
+    {
+//        if (knn_matches[i][0].distance < ratio_thresh * knn_matches[i][1].distance)
+//        {
+//            good_matches.push_back(knn_matches[i][0]);
+//        }else{
+//            bad_matches.push_back(knn_matches[i][0]);
+//        }
+
+
+
+        if (knn_matches[i][0].distance > 0.9 * knn_matches[i][1].distance)
+        {
+
+            bad_matches.push_back(knn_matches[i][0]);
+        }
+
+
+    }
+
+
+    std::vector<cv::Point2f> obj;
+    std::vector<cv::Point2f> scene;
+    for( size_t i = 0; i < bad_matches.size(); i++ ){
+
+    obj.push_back( keypoints_object[ bad_matches[i].queryIdx ].pt );
+    scene.push_back( keypoints_scene[ bad_matches[i].trainIdx ].pt );
+    }
+
+    return obj;
+
+}
+
+cv::cuda::GpuMat Rotation::keyPoints2GpuMat(cv::Mat & img){
+
+    cv::Mat kp_mat = cv::Mat::zeros(6, img.rows * img.cols, CV_32FC1);
+
+    for(int row = 0 ; row < img.rows; row++){
+        for(int col = 0 ; col < img.cols; col++){
+            cv::KeyPoint kp(row, col, 1);
+            kp_mat.at<float>(0, row * img.cols + col) = kp.pt.x;
+            kp_mat.at<float>(1, row * img.cols + col) = kp.pt.y;
+            kp_mat.at<float>(2, row * img.cols + col) = kp.response;
+            kp_mat.at<float>(3, row * img.cols + col) = kp.angle;
+            kp_mat.at<float>(4, row * img.cols + col) = kp.octave;
+            kp_mat.at<float>(5, row * img.cols + col) = kp.size;
+        }
+    }
+
+    cv::cuda::GpuMat kp_gpu(kp_mat);
+    return kp_gpu;
+}
+
+cv::Mat Rotation::cudaORB2(cv::Mat & img_object, cv::Mat & img_scene, cv::Mat & mask){
+    cv::cuda::GpuMat gpu_obj(img_object);
+    cv::cuda::GpuMat gpu_sce(img_scene);
+
+    cv::cuda::SURF_CUDA detector;
+
+    auto test_clone = test_mat_.clone();
+    std::cout<<mask.type()<<std::endl;
+    //descriptor的坐标， 后用轨道的掩码替代 TODO
+    std::vector<cv::KeyPoint> cpu_kp_obj;
+    for(int row = 0; row < mask.rows; row++){
+        for(int col = 0; col < mask.cols; col++){
+            if(mask.at<cv::Vec3b>(row,col) == cv::Vec3b(0,0,0)){
+                continue;
+            }
+              cpu_kp_obj.push_back(cv::KeyPoint(col, row, 1));
+
+              cv::circle(test_clone, cv::Point(col,row), 2, cv::Scalar(255,0,0),2);
+
+
+        }
+    }
+
+    cv::imwrite("../test_clone.jpg",test_clone);
+
+
+
+    std::vector<cv::KeyPoint> cpu_kp_sce(cpu_kp_obj);
+
+    cv::cuda::GpuMat gpu_kp_obj, gpu_kp_sce;
+    cv::cuda::GpuMat gpu_des_obj, gpu_des_sce;
+    detector.uploadKeypoints(cpu_kp_obj, gpu_kp_obj);
+    detector.uploadKeypoints(cpu_kp_sce, gpu_kp_sce);
+
+//    detector(gpu_obj, cv::cuda::GpuMat(), gpu_kp_obj, gpu_des_obj, true);
+//    detector(gpu_sce, cv::cuda::GpuMat(), gpu_kp_sce, gpu_des_sce, true);
+
+    detector(gpu_obj, cv::cuda::GpuMat(), cpu_kp_obj, gpu_des_obj, true);
+    detector(gpu_sce, cv::cuda::GpuMat(), cpu_kp_sce, gpu_des_sce, true);
+
+
+    std::vector<float> descriptors_obj;
+    std::vector<float> descriptors_sce;
+    detector.downloadDescriptors(gpu_des_obj, descriptors_obj);
+    detector.downloadDescriptors(gpu_des_sce, descriptors_sce);
+
+    std::vector<cv::KeyPoint> keypoints_obj;
+    std::vector<cv::KeyPoint> keypoints_sce;
+    detector.downloadKeypoints(gpu_kp_obj, keypoints_obj);
+    detector.downloadKeypoints(gpu_kp_sce, keypoints_sce);
+
+
+    cv::Mat cpu_des_obj, cpu_des_sce;
+    gpu_des_obj.download(cpu_des_obj);
+    gpu_des_sce.download(cpu_des_sce);
+
+
+    double total_variances = 0;
+    int len = 0;
+
+    std::vector<double> variances(cpu_des_obj.rows, -1);
+
+    for(int row = 0; row < cpu_des_obj.rows; row++){
+
+        cv::Mat row_obj = cpu_des_obj.row(row);
+        cv::Mat row_sce = cpu_des_sce.row(row);
+        double var = cv::norm(row_obj - row_sce);
+
+        if( !std::isnan(var)){
+
+           variances[row] = var;
+           total_variances += var;
+           len++;
+
+        }
+
+    }
+    double mean = 0;
+    double std = 1;
+
+    if(len){
+        mean = total_variances/len;
+
+        double total_std = 0;
+        for(int i = 0; i < variances.size(); i++){
+            if(variances[i] == -1) continue;
+            total_std += (variances[i] - mean) * (variances[i] - mean);
+        }
+        std = std::sqrt(total_std/len);
+    }
+
+   std::vector<cv::KeyPoint> abnormal_kpts;
+   for(int i = 0; i < variances.size(); i++){
+        double value = variances[i];
+        if(value == -1){
+
+            abnormal_kpts.push_back(cpu_kp_obj[i]);
+
+        }else{
+
+            double zscore = std::abs((value - mean)/std);
+            if(zscore > 3.9){
+                abnormal_kpts.push_back(cpu_kp_obj[i]);
+            }
+
+        }
+
+
+   }
+
+    for(auto i : abnormal_kpts){
+
+        cv::circle(test_mat_, cv::Point(i.pt.x, i.pt.y), 2, cv::Scalar(255,0,0),2);
+    }
+    cv::imwrite("../test_mat.jpg",test_mat_);
+
+
+
+   int sss = 1;
+
+
+    cv::Mat a;
+    return a;
+
+}
