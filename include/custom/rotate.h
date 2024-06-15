@@ -4,34 +4,64 @@
 #include <opencv2/opencv.hpp>
 #include <opencv2/cudafeatures2d.hpp>
 #include <opencv2/xfeatures2d/nonfree.hpp>
+#include <opencv2/xfeatures2d/cuda.hpp>
+
 #include <iostream>
 #include <ctime>
 #include <fstream>
 #include <algorithm>
 #include <regex>
 #include <thread>
-#include <experimental/filesystem>
+#include <filesystem>
+#include <nlohmann/json.hpp>
 #include "cuda_runtime_api.h"
 #include "NvInfer.h"
 #include "cpm.hpp"
 #include "infer.hpp"
 #include "yolo.hpp"
-#include <nlohmann/json.hpp>
 #include "ini.h"
+#include "SqliteOperator.h"
 
 using json = nlohmann::json;
 using namespace nvinfer1;
 
-struct HyperParams{
-   std::string csv_path;
-   std::string json_path;
-   std::string second_csv_path;
-   //float resize_ratio;
+enum class CheckCode{
+    SUCCEED,
+    FASTENER_FAILED,
+    SLEEPER_FAILED,
+    SQL_FAILED,
+    DJI_IMG_FAILED,
+    SLEEPER_DET_FAILED,
+    FASTENER_DET_FAILED,
+    FIRST_CSV_FAILED,
+    SECOND_CSV_FAILED,
+    FIRST_JSON_FAILED,
+    FIRST_IMG_FAILED,
+    SECOND_IMG_FAILED
 
-   std::string first_img_path;
-   std::string second_img_path;
 };
 
+struct IniParams{
+    std::string fastener_path;
+    std::string sleeper_path;
+    std::string sql_path;
+    std::string dji_img_path ;
+    std::string sleeper_detection_path ;
+    std::string fastener_detection_path ;
+    std::string cropped_img_path ;
+    float confidence_threshold ;
+    float nms_threshold ;
+};
+
+struct StartParams{
+    std::string first_csv_path ;
+    std::string second_csv_path ;
+    std::string first_json_path ;
+    std::string first_img_path ;
+    std::string second_img_path ;
+    std::string save_second_img_path;
+    int taskID;
+};
 
 struct CsvInfo{
     std::string img_path;
@@ -44,7 +74,7 @@ struct CsvInfo{
 struct Location{
     std::string label;
     std::vector<cv::Point2f> pts;
-    int type; //0:abnormal,  1: normal
+    int type; //0:abnormal, 1:normal;
 };
 
 
@@ -66,15 +96,31 @@ class Logger : public ILogger {
 
 class Rotation {
 public:
-    Rotation(){};
-    ~Rotation(){
-        delete[] sleeper_cls_in_;
-        delete[] sleeper_cls_out_;
-        delete[] fastener_cls_in_;
-        delete[] fastener_cls_out_;
-    }
+    Rotation();
+    ~Rotation();
+    std::atomic<int> status_{2};//0:initiated, 1:running, 2:stopped, 3:completed;
+    std::unique_ptr<CSqliteOperator> csql_;
+    std::mutex mtx_;
+    std::atomic<bool> break_flag_{false};
+    std::atomic<int> total_nums_{0};
+    std::atomic<int> current_idx_{0};
+    std::atomic<int> current_taskID_{-1};
+    CheckCode start(StartParams & start_params);
+    CheckCode init(IniParams & ini_params);
+    bool check(std::string & path);
+    void end();
+    int getStatus();
+    float getProcess();
+    int getTaskID();
+    void testMatch();
+    void testcudaORB(cv::Mat & img_object, cv::Mat & img_scene);
+    cv::Mat cudaORB2(cv::Mat & img_object, cv::Mat & img_scene, cv::Mat & mask);
 
-//ground
+    std::vector<cv::Point2f> ORB2(cv::Mat & img_object, cv::Mat & img_scene);
+    cv::cuda::GpuMat keyPoints2GpuMat(cv::Mat & img);
+
+    cv::Mat test_mat_;
+    //ground
     void initDetection();
     yolo::Image cvimg(const cv::Mat & image);
     cv::Mat preprocessImg(cv::Mat & img, const int & input_w, const int & input_h, int & padw, int & padh);
@@ -83,6 +129,7 @@ public:
     std::vector<std::string> listFiles(const std::string & directory, const std::string & ext);
     void rotateInference(cv::Mat & img, json & j);
     void runGround();
+
 
 private:
     std::shared_ptr<yolo::Infer> yolo_;
@@ -110,7 +157,6 @@ private:
 
 //sky
 public:
-    void initParams(HyperParams & params);
     void loadEngine(const std::string& path, const int & flag);
     cv::Mat ORB(cv::Mat & img_object, cv::Mat & img_scene);
     cv::Mat cudaORB(cv::Mat & img_object, cv::Mat & img_scene);
@@ -127,8 +173,7 @@ public:
     void skyInference( std::vector<Location> & location, cv::Mat & img);
     void testSky();
     void drawSingleResult(SingleResult & single_result, cv::Mat & img);
-    std::vector<SingleResult> runSky();
-    void testRunSky();
+    std::vector<SingleResult> runSky(int taskID = -1);
     void initGroundSky();
 
 private:
@@ -143,7 +188,7 @@ private:
     int WIDTH_ = 8192;
     int HEIGHT_ = 5460;
     int nfeatures_  = 1000;
-    float resize_ratio_ = 0.2;
+    float resize_ratio_ = 0.3;
     float * sleeper_cls_in_ = new float[1*3*224*512]{};
     float * fastener_cls_in_ = new float[1*3*224*224]{};
     float * sleeper_cls_out_ = new float[1*2]{};
